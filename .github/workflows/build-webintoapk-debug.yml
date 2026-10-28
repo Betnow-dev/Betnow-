@@ -2,6 +2,11 @@ name: Build WebIntoAPK Debug APK
 
 on:
   workflow_dispatch:
+    inputs:
+      build_label:
+        description: Optional label for this APK build
+        required: false
+        type: string
 
 permissions:
   contents: read
