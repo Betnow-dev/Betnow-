@@ -1,6 +1,6 @@
 name: Build Website Apps
 
-on:
+"on":
   workflow_dispatch:
     inputs:
       build_id:
