@@ -1,6 +1,6 @@
 name: Build WebIntoAPK APK
 
-on:
+"on":
   push:
     branches:
       - webintoapk-build
