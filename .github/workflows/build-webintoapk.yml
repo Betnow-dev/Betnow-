@@ -1,0 +1,40 @@
+name: Build WebIntoAPK APK
+
+on:
+  push:
+    branches:
+      - webintoapk-build
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      WEBINTOAPK_SUPABASE_URL: ${{ secrets.WEBINTOAPK_SUPABASE_URL }}
+      WEBINTOAPK_SUPABASE_ANON_KEY: ${{ secrets.WEBINTOAPK_SUPABASE_ANON_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK packages
+        run: "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build WebIntoAPK
+        run: ./gradlew --no-daemon --max-workers=2 -p webintoapk :app:assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webintoapk-debug-apk
+          path: webintoapk/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
