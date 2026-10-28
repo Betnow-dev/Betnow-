@@ -1,0 +1,137 @@
+name: Build Website Apps
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: Supabase app build ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build and upload app packages
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          set -Eeuo pipefail
+
+          update_build() {
+            curl --fail --silent --show-error \
+              --request PATCH \
+              --header "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+              --header "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+              --header "Content-Type: application/json" \
+              "$SUPABASE_URL/rest/v1/app_builds?id=eq.$BUILD_ID" \
+              --data "$1" >/dev/null
+          }
+
+          on_error() {
+            trap - ERR
+            update_build "{\"status\":\"failed\",\"error_message\":\"Build failed; review the private GitHub Actions log.\",\"finished_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" || true
+            rm -f "$RUNNER_TEMP/app-signing.jks"
+            exit 1
+          }
+          trap on_error ERR
+
+          test -n "$SUPABASE_URL"
+          test -n "$SUPABASE_SERVICE_ROLE_KEY"
+          test -n "$ANDROID_KEYSTORE_BASE64"
+          test -n "$ANDROID_KEY_ALIAS"
+          test -n "$ANDROID_KEY_PASSWORD"
+          test -n "$ANDROID_STORE_PASSWORD"
+
+          BUILD_ROW=$(curl --fail --silent --show-error \
+            --header "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            --header "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            "$SUPABASE_URL/rest/v1/app_builds?id=eq.$BUILD_ID&select=id,app_id,status")
+          APP_ID=$(jq -er '.[0].app_id' <<<"$BUILD_ROW")
+          APP_ROW=$(curl --fail --silent --show-error \
+            --header "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            --header "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            "$SUPABASE_URL/rest/v1/app_projects?id=eq.$APP_ID&select=name,package_name,site_url,admob_app_id,admob_banner_id,status_bar_color")
+
+          APP_NAME=$(jq -er '.[0].name' <<<"$APP_ROW")
+          APP_PACKAGE=$(jq -er '.[0].package_name' <<<"$APP_ROW")
+          APP_URL=$(jq -er '.[0].site_url' <<<"$APP_ROW")
+          ADMOB_APP_ID=$(jq -er '.[0].admob_app_id' <<<"$APP_ROW")
+          ADMOB_BANNER_ID=$(jq -er '.[0].admob_banner_id' <<<"$APP_ROW")
+          STATUS_BAR_COLOR=$(jq -er '.[0].status_bar_color' <<<"$APP_ROW")
+
+          [[ "$APP_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.\ -]{1,59}$ ]]
+          [[ "$APP_PACKAGE" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$ ]]
+          [[ "$APP_URL" =~ ^https://[^[:space:]]+$ ]]
+          [[ "$ADMOB_APP_ID" =~ ^ca-app-pub-[0-9]+~[0-9]+$ ]]
+          [[ "$ADMOB_BANNER_ID" =~ ^ca-app-pub-[0-9]+/[0-9]+$ ]]
+          [[ "$STATUS_BAR_COLOR" =~ ^#[0-9A-Fa-f]{6}$ ]]
+
+          update_build "{\"status\":\"running\",\"workflow_run_id\":$GITHUB_RUN_ID,\"started_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/app-signing.jks"
+          ./gradlew --no-daemon assembleUserRelease bundleUserRelease \
+            -PAPP_NAME="$APP_NAME" \
+            -PAPP_PACKAGE="$APP_PACKAGE" \
+            -PAPP_URL="$APP_URL" \
+            -PAPP_VERSION_CODE="$GITHUB_RUN_NUMBER" \
+            -PAPP_VERSION_NAME="1.0.$GITHUB_RUN_NUMBER" \
+            -PADMOB_APP_ID="$ADMOB_APP_ID" \
+            -PADMOB_BANNER_ID="$ADMOB_BANNER_ID" \
+            -PSTATUS_BAR_COLOR="$STATUS_BAR_COLOR" \
+            -PREMOTE_SETTINGS_ENABLED=false \
+            -PSIGNING_STORE_FILE="$RUNNER_TEMP/app-signing.jks" \
+            -PSIGNING_STORE_PASSWORD="$ANDROID_STORE_PASSWORD" \
+            -PSIGNING_KEY_ALIAS="$ANDROID_KEY_ALIAS" \
+            -PSIGNING_KEY_PASSWORD="$ANDROID_KEY_PASSWORD"
+
+          APK_PATH="app/build/outputs/apk/user/release/app-user-release.apk"
+          AAB_PATH="app/build/outputs/bundle/userRelease/app-user-release.aab"
+          OBJECT_PREFIX="$APP_ID/$BUILD_ID"
+          APK_OBJECT_PATH="$OBJECT_PREFIX/app-release.apk"
+          AAB_OBJECT_PATH="$OBJECT_PREFIX/app-release.aab"
+
+          upload_artifact() {
+            local file_path="$1"
+            local object_path="$2"
+            local content_type="$3"
+            curl --fail --silent --show-error \
+              --request POST \
+              --header "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+              --header "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+              --header "Content-Type: $content_type" \
+              --header "x-upsert: true" \
+              --data-binary "@$file_path" \
+              "$SUPABASE_URL/storage/v1/object/app-builds/$object_path" >/dev/null
+          }
+
+          upload_artifact "$APK_PATH" "$APK_OBJECT_PATH" "application/vnd.android.package-archive"
+          upload_artifact "$AAB_PATH" "$AAB_OBJECT_PATH" "application/octet-stream"
+          update_build "{\"status\":\"succeeded\",\"apk_object_path\":\"$APK_OBJECT_PATH\",\"aab_object_path\":\"$AAB_OBJECT_PATH\",\"finished_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+          rm -f "$RUNNER_TEMP/app-signing.jks"
